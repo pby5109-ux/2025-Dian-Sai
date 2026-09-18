@@ -1,0 +1,273 @@
+[1mdiff --git "a/\347\237\251\345\275\2428.3.1.py" "b/\347\237\251\345\275\2428.3.1.py"[m
+[1mindex 9525297..e69de29 100644[m
+[1m--- "a/\347\237\251\345\275\2428.3.1.py"[m
+[1m+++ "b/\347\237\251\345\275\2428.3.1.py"[m
+[36m@@ -1,268 +0,0 @@[m
+[31m-# K230无屏矩形定位：启动自动估计Otsu阈值，GPIO32按键重新估计。[m
+[31m-import time, os, gc, sys,math[m
+[31m-from math import atan,sqrt,atan2,sqrt[m
+[31m-from media.sensor import *[m
+[31m-from media.media import *[m
+[31m-import cv_lite[m
+[31m-from time import ticks_ms[m
+[31m-from machine import UART[m
+[31m-from machine import FPIOA[m
+[31m-from machine import Pin[m
+[31m-[m
+[31m-# 实例化FPIOA[m
+[31m-fpioa = FPIOA()[m
+[31m-# UART2和重新估计按键[m
+[31m-fpioa.set_function(11, fpioa.UART2_TXD)[m
+[31m-fpioa.set_function(12, fpioa.UART2_RXD)[m
+[31m-fpioa.set_function(32, FPIOA.GPIO32)[m
+[31m-fpioa.set_function(31, FPIOA.GPIO32)[m
+[31m-RECALIBRATE_KEY = Pin(32, Pin.IN, Pin.PULL_DOWN)  # 高有效：未按为低，按下接3.3V，按下重新估计阈值[m
+[31m-[m
+[31m-# UART2: baudrate 115200, 8bits, parity none, one stopbits[m
+[31m-uart = UART(UART.UART2, baudrate=115200, bits=UART.EIGHTBITS, parity=UART.PARITY_NONE, stop=UART.STOPBITS_ONE)[m
+[31m-[m
+[31m-DETECT_WIDTH = 480[m
+[31m-DETECT_HEIGHT = 320[m
+[31m-sensor = None[m
+[31m-media_started = False[m
+[31m-image_shape = [DETECT_HEIGHT, DETECT_WIDTH]  # cv_lite: 高、宽[m
+[31m-S_THRESHOLD = 2000  # 候选最小面积，与灰度分割阈值不同[m
+[31m-# -------------------------------[m
+[31m-# 可调参数（建议调试时调整）/ Adjustable parameters (recommended for tuning)[m
+[31m-# -------------------------------[m
+[31m-canny_thresh1       = 50        # Canny 边缘检测低阈值 / Canny edge low threshold[m
+[31m-canny_thresh2       = 150       # Canny 边缘检测高阈值 / Canny edge high threshold[m
+[31m-approx_epsilon      = 0.04      # 多边形拟合精度（比例） / Polygon approximation precision (ratio)[m
+[31m-area_min_ratio      = 0.001     # 最小面积比例（0~1） / Minimum area ratio (0~1)[m
+[31m-max_angle_cos       = 0.5       # 最大角余弦（值越小越接近矩形） / Max cosine of angle (smaller closer to rectangle)[m
+[31m-gaussian_blur_size  = 5         # 高斯模糊核大小（奇数） / Gaussian blur kernel size (odd number)[m
+[31m-length_threshold=120[m
+[31m-last=0[m
+[31m-[m
+[31m-[m
+[31m-class DebouncedPress:[m
+[31m-    """高有效按键（未按0、按下1）：状态稳定30ms后确认，长按只产生一次事件。"""[m
+[31m-    def __init__(self, raw, now):[m
+[31m-        self.raw = raw[m
+[31m-        self.stable = raw[m
+[31m-        self.changed = now[m
+[31m-[m
+[31m-    def update(self, raw, now):[m
+[31m-        if raw != self.raw:[m
+[31m-            self.raw = raw[m
+[31m-            self.changed = now[m
+[31m-        if raw != self.stable and time.ticks_diff(now, self.changed) >= 30:[m
+[31m-            self.stable = raw[m
+[31m-            return raw == 1[m
+[31m-        return False[m
+[31m-[m
+[31m-[m
+[31m-class AutoThreshold:[m
+[31m-    """启动或按键请求时自动估计，随后保持；不保存到SD卡。[m
+[31m-[m
+[31m-    无灰度对比的帧不能用于标定，此时保留重估请求、跳过识别，[m
+[31m-    下一帧重试，不用失效旧值冒充本次标定结果。[m
+[31m-    """[m
+[31m-    def __init__(self):[m
+[31m-        self.value = None[m
+[31m-        self.pending = True[m
+[31m-        self.generation = 0[m
+[31m-[m
+[31m-    def request(self):[m
+[31m-        self.pending = True[m
+[31m-[m
+[31m-    def get(self, gray):[m
+[31m-        if self.pending:[m
+[31m-            histogram = gray.get_histogram()[m
+[31m-            stats = histogram.get_statistics()[m
+[31m-            if stats.max() <= stats.min():[m
+[31m-                return None[m
+[31m-            value = int(histogram.get_threshold().value())[m
+[31m-            if not 0 <= value <= 255:[m
+[31m-                raise ValueError('Otsu threshold outside grayscale range')[m
+[31m-            self.value = value[m
+[31m-            self.pending = False[m
+[31m-            self.generation += 1[m
+[31m-            print('Otsu threshold:', self.value)[m
+[31m-        return self.value[m
+[31m-[m
+[31m-[m
+[31m-def prepare_detection(raw, control):[m
+[31m-    gray = raw.to_grayscale()[m
+[31m-    value = control.get(gray)[m
+[31m-    if value is None:[m
+[31m-        return None[m
+[31m-    # 灰度二值图转回RGB888以保留现有cv_lite接口；坐标仍为480x320。[m
+[31m-    return gray.binary([(0, value)]).to_rgb888()[m
+[31m-[m
+[31m-[m
+[31m-def format_coord(coord):[m
+[31m-    # 格式化为：符号位（+/-） + 3 位数值（补零）[m
+[31m-    return f"{coord:+04d}"  # 如 -123 → "-123"，12 → "+012"[m
+[31m-def split_to_2d(arr, cols=1):[m
+[31m-    return [arr[i:i + cols] for i in range(0, len(arr), cols)][m
+[31m-def get_vertices(rect):[m
+[31m-    x, y, w, h = rect[m
+[31m-    # 计算四个顶点坐标[m
+[31m-    top_left = (x, y)[m
+[31m-    top_right = (x + w, y)[m
+[31m-    bottom_right = (x + w, y + h)[m
+[31m-    bottom_left = (x, y + h)[m
+[31m-    return [top_left, top_right, bottom_right, bottom_left][m
+[31m-def find_max(arr):[m
+[31m-    max_size=0[m
+[31m-    for s in range (len(arr)):[m
+[31m-        if arr[s][2]*arr[s][3] > max_size:[m
+[31m-            max_blob=arr[s][m
+[31m-            max_size = arr[s][2]*arr[s][3][m
+[31m-    return max_blob[m
+[31m-[m
+[31m- # 定义一个函数来判断两条线段是否平行[m
+[31m-def are_segments_parallel(theta1, theta2, tolerance=30):[m
+[31m-    # 计算角度差[m
+[31m-    angle_difference = abs(theta1 - theta2)[m
+[31m-    if(angle_difference>180):angle_difference=angle_difference-180[m
+[31m-    # 检查角度差是否为0度或180度（考虑浮点数精度）[m
+[31m-    return math.isclose(angle_difference, 0, abs_tol=tolerance) or math.isclose(angle_difference, 180, abs_tol=tolerance)[m
+[31m-def are_segments_vertical(theta1, theta2, tolerance=30):[m
+[31m-    # 计算角度差[m
+[31m-    angle_difference = abs(theta1 - theta2)[m
+[31m-    if(angle_difference>180):angle_difference=angle_difference-180[m
+[31m-    # 检查角度差是否为0度或180度（考虑浮点数精度）[m
+[31m-    return math.isclose(angle_difference, 90, abs_tol=tolerance)[m
+[31m-def find_intersection(x1, y1, x2, y2, x3, y3, x4, y4):[m
+[31m-    def calculate_determinant(A, B):[m
+[31m-        return A[0] * B[1] - A[1] * B[0][m
+[31m-[m
+[31m-    # 向量 AB 和 AC[m
+[31m-    AB = (x2 - x1, y2 - y1)[m
+[31m-    AC = (x3 - x1, y3 - y1)[m
+[31m-    # 向量 CD[m
+[31m-    CD = (x4 - x3, y4 - y3)[m
+[31m-[m
+[31m-    # 计算叉积 determinant(AB, CD)[m
+[31m-    det = calculate_determinant(AB, CD)[m
+[31m-[m
+[31m-    if det == 0:[m
+[31m-        # 直线平行或共线，没有唯一交点[m
+[31m-        return None[m
+[31m-[m
+[31m-    # 向量 DA[m
+[31m-    DA = (x1 - x4, y1 - y4)[m
+[31m-[m
+[31m-    # 计算参数 t 和 u[m
+[31m-    t = calculate_determinant(AC, CD) / det[m
+[31m-    u = calculate_determinant(AC, AB) / det[m
+[31m-[m
+[31m-    # 计算交点坐标[m
+[31m-    intersection_x = x1 + t * AB[0][m
+[31m-    intersection_y = y1 + t * AB[1][m
+[31m-[m
+[31m-    return int(intersection_x), int(intersection_y)[m
+[31m-#def are_segments_vertical(len1, len2, tolerance=0.2):[m
+[31m-#        # 计算角度差[m
+[31m-#        len_bili = 1en1/1en2[m
+[31m-#        if(angle_difference>180):angle_difference=angle_difference-180[m
+[31m-#        # 检查角度差是否为0度或180度（考虑浮点数精度）[m
+[31m-#        return math.isclose(angle_difference, 90, abs_tol=tolerance)[m
+[31m-def select_rectangle_center(rects):[m
+[31m-    """由大到小筛选几何有效候选；大干扰框失败后继续检查其他候选。"""[m
+[31m-    candidates = [r for r in (rects or []) if len(r) >= 12 and r[2] > 0 and r[3] > 0][m
+[31m-    candidates.sort(key=lambda r: r[2] * r[3], reverse=True)[m
+[31m-    for r in candidates:[m
+[31m-        if r[2] * r[3] <= S_THRESHOLD:[m
+[31m-            continue[m
+[31m-        c = [(r[4 + 2*i], r[5 + 2*i]) for i in range(4)][m
+[31m-        edges = ((0, 1), (2, 3), (0, 3), (1, 2))[m
+[31m-        lengths = [sqrt((c[a][0]-c[b][0])**2 + (c[a][1]-c[b][1])**2) for a, b in edges][m
+[31m-        if min(lengths) <= 30:[m
+[31m-            continue[m
+[31m-        if abs(lengths[0]-lengths[1]) >= length_threshold or abs(lengths[2]-lengths[3]) >= length_threshold:[m
+[31m-            continue[m
+[31m-        angles = [math.degrees(math.atan2(c[a][1]-c[b][1], c[a][0]-c[b][0])) for a, b in edges][m
+[31m-        if not (are_segments_parallel(angles[0], angles[1]) and[m
+[31m-                are_segments_parallel(angles[2], angles[3]) and[m
+[31m-                are_segments_vertical(angles[0], angles[2])):[m
+[31m-            continue[m
+[31m-        center = find_intersection(c[0][0], c[0][1], c[2][0], c[2][1],[m
+[31m-                                   c[1][0], c[1][1], c[3][0], c[3][1])[m
+[31m-        if center is not None and 0 <= center[0] < DETECT_WIDTH and 0 <= center[1] < DETECT_HEIGHT:[m
+[31m-            return center[m
+[31m-    return None[m
+[31m-[m
+[31m-[m
+[31m-def process_frame(raw, control):[m
+[31m-    detection = prepare_detection(raw, control)[m
+[31m-    if detection is None:[m
+[31m-        return None[m
+[31m-    pixels = detection.to_numpy_ref()[m
+[31m-    rects = cv_lite.rgb888_find_rectangles_with_corners([m
+[31m-        image_shape, pixels, canny_thresh1, canny_thresh2,[m
+[31m-        approx_epsilon, area_min_ratio, max_angle_cos, gaussian_blur_size)[m
+[31m-    # detection存活到库调用结束，避免numpy引用对应的图像缓冲过早释放。[m
+[31m-    return select_rectangle_center(rects)[m
+[31m-[m
+[31m-[m
+[31m-def send_center(center):[m
+[31m-    if center is None:[m
+[31m-        # 保留旧工程的失败消息；接收端目前不解析此格式，详见集成说明。[m
+[31m-        # 不用[+999+999*]代替，以免现有控制端将哨兵值当成运动误差。[m
+[31m-        uart.write('(x=999,y=999)')[m
+[31m-        return[m
+[31m-    dx = DETECT_WIDTH // 2 - center[0][m
+[31m-    dy = DETECT_HEIGHT // 2 - center[1][m
+[31m-    uart.write('[' + format_coord(dx) + format_coord(dy) + '*]')[m
+[31m-[m
+[31m-[m
+[31m-def camera_init():[m
+[31m-    global sensor, media_started[m
+[31m-    sensor = Sensor()[m
+[31m-    sensor.reset()[m
+[31m-    sensor.set_framesize(width=DETECT_WIDTH, height=DETECT_HEIGHT)[m
+[31m-    sensor.set_pixformat(Sensor.RGB888)[m
+[31m-    MediaManager.init()[m
+[31m-    media_started = True[m
+[31m-    sensor.run()[m
+[31m-[m
+[31m-[m
+[31m-def camera_deinit():[m
+[31m-    global sensor, media_started[m
+[31m-    try:[m
+[31m-        if sensor is not None:[m
+[31m-            sensor.stop()[m
+[31m-    finally:[m
+[31m-        sensor = None[m
+[31m-        if media_started:[m
+[31m-            MediaManager.deinit()[m
+[31m-            media_started = False[m
+[31m-[m
+[31m-[m
+[31m-def capture_picture():[m
+[31m-    control = AutoThreshold()[m
+[31m-    key = DebouncedPress(RECALIBRATE_KEY.value(), ticks_ms())[m
+[31m-    while True:[m
+[31m-        os.exitpoint()[m
+[31m-        if key.update(RECALIBRATE_KEY.value(), ticks_ms()):[m
+[31m-            control.request()[m
+[31m-        raw = sensor.snapshot()[m
+[31m-        center = process_frame(raw, control)[m
+[31m-        send_center(center)[m
+[31m-        del raw[m
+[31m-[m
+[31m-[m
+[31m-def main():[m
+[31m-    os.exitpoint(os.EXITPOINT_ENABLE)[m
+[31m-    try:[m
+[31m-        camera_init()[m
+[31m-        capture_picture()[m
+[31m-    except KeyboardInterrupt:[m
+[31m-        print('user stop')[m
+[31m-    except Exception as e:[m
+[31m-        print('vision stopped:', e)[m
+[31m-        raise[m
+[31m-    finally:[m
+[31m-        camera_deinit()[m
+[31m-[m
+[31m-[m
+[31m-if __name__ == '__main__':[m
+[31m-    main()[m
