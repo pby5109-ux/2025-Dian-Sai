@@ -1,8 +1,9 @@
-# K230无屏矩形定位：启动自动估计Otsu阈值，GPIO32按键重新估计。
+# K230矩形定位：自动阈值、按键重估、IDE预览（无需外接屏幕）。
 import time, os, gc, sys,math
 from math import atan,sqrt,atan2,sqrt
 from media.sensor import *
 from media.media import *
+from media.display import Display
 import cv_lite
 from time import ticks_ms
 from machine import UART
@@ -15,6 +16,7 @@ fpioa = FPIOA()
 fpioa.set_function(11, fpioa.UART2_TXD)
 fpioa.set_function(12, fpioa.UART2_RXD)
 fpioa.set_function(32, FPIOA.GPIO32)
+
 RECALIBRATE_KEY = Pin(32, Pin.IN, Pin.PULL_DOWN)  # 高有效：未按为低，按下接3.3V，按下重新估计阈值
 
 # UART2: baudrate 115200, 8bits, parity none, one stopbits
@@ -24,6 +26,8 @@ DETECT_WIDTH = 480
 DETECT_HEIGHT = 320
 sensor = None
 media_started = False
+display_started = False
+IDE_PREVIEW = True  # IDE虚拟预览，无需外接屏幕；脱机运行可设False
 image_shape = [DETECT_HEIGHT, DETECT_WIDTH]  # cv_lite: 高、宽
 S_THRESHOLD = 2000  # 候选最小面积，与灰度分割阈值不同
 # -------------------------------
@@ -164,7 +168,7 @@ def find_intersection(x1, y1, x2, y2, x3, y3, x4, y4):
 #        if(angle_difference>180):angle_difference=angle_difference-180
 #        # 检查角度差是否为0度或180度（考虑浮点数精度）
 #        return math.isclose(angle_difference, 90, abs_tol=tolerance)
-def select_rectangle_center(rects):
+def select_rectangle_center(rects, preview=None):
     """由大到小筛选几何有效候选；大干扰框失败后继续检查其他候选。"""
     candidates = [r for r in (rects or []) if len(r) >= 12 and r[2] > 0 and r[3] > 0]
     candidates.sort(key=lambda r: r[2] * r[3], reverse=True)
@@ -186,6 +190,11 @@ def select_rectangle_center(rects):
         center = find_intersection(c[0][0], c[0][1], c[2][0], c[2][1],
                                    c[1][0], c[1][1], c[3][0], c[3][1])
         if center is not None and 0 <= center[0] < DETECT_WIDTH and 0 <= center[1] < DETECT_HEIGHT:
+            if preview is not None:
+                for i in range(4):
+                    a, b = c[i], c[(i + 1) % 4]
+                    preview.draw_line(a[0], a[1], b[0], b[1], color=(0, 255, 0), thickness=2)
+                preview.draw_circle(center[0], center[1], 3, color=(255, 0, 0), thickness=2)
             return center
     return None
 
@@ -199,7 +208,7 @@ def process_frame(raw, control):
         image_shape, pixels, canny_thresh1, canny_thresh2,
         approx_epsilon, area_min_ratio, max_angle_cos, gaussian_blur_size)
     # detection存活到库调用结束，避免numpy引用对应的图像缓冲过早释放。
-    return select_rectangle_center(rects)
+    return select_rectangle_center(rects, raw if IDE_PREVIEW else None)
 
 
 def send_center(center):
@@ -214,26 +223,36 @@ def send_center(center):
 
 
 def camera_init():
-    global sensor, media_started
+    global sensor, media_started, display_started
     sensor = Sensor()
     sensor.reset()
     sensor.set_framesize(width=DETECT_WIDTH, height=DETECT_HEIGHT)
     sensor.set_pixformat(Sensor.RGB888)
+    if IDE_PREVIEW:
+        Display.init(Display.VIRT, width=DETECT_WIDTH, height=DETECT_HEIGHT,
+                     fps=30, to_ide=True)
+        display_started = True
     MediaManager.init()
     media_started = True
     sensor.run()
 
 
 def camera_deinit():
-    global sensor, media_started
+    global sensor, media_started, display_started
     try:
         if sensor is not None:
             sensor.stop()
     finally:
         sensor = None
-        if media_started:
-            MediaManager.deinit()
-            media_started = False
+        try:
+            if display_started:
+                Display.deinit()
+        finally:
+            display_started = False
+            if media_started:
+                time.sleep_ms(100)
+                MediaManager.deinit()
+                media_started = False
 
 
 def capture_picture():
@@ -246,6 +265,8 @@ def capture_picture():
         raw = sensor.snapshot()
         center = process_frame(raw, control)
         send_center(center)
+        if IDE_PREVIEW:
+            Display.show_image(raw)  # 未识别到目标时也显示原始画面
         del raw
 
 
