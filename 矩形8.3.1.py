@@ -15,7 +15,7 @@ fpioa = FPIOA()
 fpioa.set_function(11, fpioa.UART2_TXD)
 fpioa.set_function(12, fpioa.UART2_RXD)
 fpioa.set_function(32, FPIOA.GPIO32)
-
+fpioa.set_function(32, FPIOA.GPIO32)
 RECALIBRATE_KEY = Pin(32, Pin.IN, Pin.PULL_DOWN)  # 高有效：未按为低，按下接3.3V，按下重新估计阈值
 
 # UART2: baudrate 115200, 8bits, parity none, one stopbits
