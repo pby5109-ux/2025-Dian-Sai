@@ -37,7 +37,7 @@ canny_thresh1       = 50        # Canny 边缘检测低阈值 / Canny edge low t
 canny_thresh2       = 150       # Canny 边缘检测高阈值 / Canny edge high threshold
 approx_epsilon      = 0.04      # 多边形拟合精度（比例） / Polygon approximation precision (ratio)
 area_min_ratio      = 0.001     # 最小面积比例（0~1） / Minimum area ratio (0~1)
-max_angle_cos       = 0.5       # 最大角余弦（值越小越接近矩形） / Max cosine of angle (smaller closer to rectangle)
+max_angle_cos       = 0.3       # 最大角余弦（值越小越接近矩形） / Max cosine of angle (smaller closer to rectangle)
 gaussian_blur_size  = 5         # 高斯模糊核大小（奇数） / Gaussian blur kernel size (odd number)
 length_threshold=120
 last=0
@@ -70,10 +70,10 @@ class AutoThreshold:
         self.value = None
         self.pending = True
         self.generation = 0
-
+    #请求阈值重测
     def request(self):
         self.pending = True
-
+    #进行接收，如果有请求，就进行重新测试
     def get(self, gray):
         if self.pending:
             histogram = gray.get_histogram()
@@ -89,7 +89,7 @@ class AutoThreshold:
             print('Otsu threshold:', self.value)
         return self.value
 
-
+#进行图片转灰度，并获得otsu后的分界阈值
 def prepare_detection(raw, control):
     gray = raw.to_grayscale()
     value = control.get(gray)
@@ -200,10 +200,17 @@ def select_rectangle_center(rects, preview=None):
 
 
 def process_frame(raw, control):
+    #灰度二值图转化为的rgb888，图片依旧是黑白，只是需要格式变了，为了使用cv-lite
     detection = prepare_detection(raw, control)
     if detection is None:
         return None
+    #将图像数据转化为numpy数组
     pixels = detection.to_numpy_ref()
+    #这里是寻找矩形，利用到了cv-lite，参数的分别介绍，
+    #1，大小，2,3，边缘检测的阈值（差值小于小阈值，认为是噪点抛弃，之间的事弱边缘，然后就是强边缘）
+    #3，边缘拟合，这里的是设置的变长的比例，小于拟合误差，合并为一条直线，4，筛选的最小面积
+    #6，最大的角余弦，一般越接近0越是90°
+    #7，高斯模糊平滑图片，5是模糊核的大小，逐个像素按照5×5的矩阵加权计算，看看是否保留（高斯模糊 = 边缘检测前的降噪，让后面的 Canny 更容易找到干净的矩形边。）
     rects = cv_lite.rgb888_find_rectangles_with_corners(
         image_shape, pixels, canny_thresh1, canny_thresh2,
         approx_epsilon, area_min_ratio, max_angle_cos, gaussian_blur_size)
@@ -228,10 +235,13 @@ def camera_init():
     sensor.reset()
     sensor.set_framesize(width=DETECT_WIDTH, height=DETECT_HEIGHT)
     sensor.set_pixformat(Sensor.RGB888)
+    #是否确定打开ide图像显示，字节设置打开还是不打开
     if IDE_PREVIEW:
+        #初始化图像的显示（ide）
         Display.init(Display.VIRT, width=DETECT_WIDTH, height=DETECT_HEIGHT,
                      fps=30, to_ide=True)
         display_started = True
+    #帮摄像头、图像缓冲区、Display 等多媒体模块统一管理内存和数据缓冲
     MediaManager.init()
     media_started = True
     sensor.run()
